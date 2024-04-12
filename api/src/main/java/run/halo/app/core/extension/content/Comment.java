@@ -100,6 +100,7 @@ public class Comment extends AbstractExtension {
         public static final String KIND_EMAIL = "Email";
         public static final String AVATAR_ANNO = "avatar";
         public static final String WEBSITE_ANNO = "website";
+        public static final String EMAIL_HASH_ANNO = "email-hash";
 
         @Schema(requiredMode = REQUIRED, minLength = 1)
         private String kind;
@@ -116,6 +117,10 @@ public class Comment extends AbstractExtension {
         public String getAnnotation(String key) {
             return annotations == null ? null : annotations.get(key);
         }
+
+        public static String ownerIdentity(String kind, String name) {
+            return kind + "#" + name;
+        }
     }
 
     @Data
@@ -130,6 +135,10 @@ public class Comment extends AbstractExtension {
         private Integer unreadReplyCount;
 
         private Boolean hasNewReply;
+    }
+
+    public static String toSubjectRefKey(Ref subjectRef) {
+        return subjectRef.getGroup() + "/" + subjectRef.getKind() + "/" + subjectRef.getName();
     }
 
     public static int getUnreadReplyCount(List<Reply> replies, Instant lastReadTime) {

@@ -13,7 +13,6 @@ import static org.mockito.Mockito.when;
 
 import java.util.List;
 import java.util.Locale;
-import java.util.function.Predicate;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -31,7 +30,9 @@ import run.halo.app.core.extension.notification.Reason;
 import run.halo.app.core.extension.notification.ReasonType;
 import run.halo.app.core.extension.notification.Subscription;
 import run.halo.app.extension.GroupVersion;
+import run.halo.app.extension.ListResult;
 import run.halo.app.extension.Metadata;
+import run.halo.app.extension.PageRequest;
 import run.halo.app.extension.ReactiveExtensionClient;
 import run.halo.app.infra.utils.JsonUtils;
 
@@ -126,10 +127,10 @@ class DefaultNotificationCenterTest {
 
         var subscriber = subscription.getSpec().getSubscriber();
 
-        doReturn(Flux.just(subscription))
-            .when(spyNotificationCenter).listSubscription(eq(subscriber));
-
         var reason = subscription.getSpec().getReason();
+
+        doReturn(Flux.just(subscription))
+            .when(spyNotificationCenter).listSubscription(eq(subscriber), eq(reason));
 
         when(client.create(any(Subscription.class))).thenReturn(Mono.empty());
 
@@ -140,10 +141,11 @@ class DefaultNotificationCenterTest {
         // not exists subscription will create a new subscription
         var newReason = JsonUtils.deepCopy(reason);
         newReason.setReasonType("fake-reason-type");
+        doReturn(Flux.empty())
+            .when(spyNotificationCenter).listSubscription(eq(subscriber), eq(newReason));
         spyNotificationCenter.subscribe(subscriber, newReason).block();
         verify(client).create(any(Subscription.class));
     }
-
 
     @Test
     public void testUnsubscribe() {
@@ -151,8 +153,9 @@ class DefaultNotificationCenterTest {
         subscriber.setName("anonymousUser#A");
         var spyNotificationCenter = spy(notificationCenter);
         var subscriptions = createSubscriptions();
-        doReturn(Flux.fromIterable(subscriptions))
-            .when(spyNotificationCenter).listSubscription(eq(subscriber));
+
+        doReturn(Mono.just(new ListResult<>(subscriptions)))
+            .when(spyNotificationCenter).pageSubscriptionBy(eq(subscriber), any(PageRequest.class));
 
         when(client.delete(any(Subscription.class))).thenReturn(Mono.empty());
 
@@ -170,16 +173,19 @@ class DefaultNotificationCenterTest {
         var subscription = subscriptions.get(0);
 
         var subscriber = subscription.getSpec().getSubscriber();
-        doReturn(Flux.just(subscription))
-            .when(spyNotificationCenter).listSubscription(eq(subscriber));
 
         var reason = subscription.getSpec().getReason();
 
         var newReason = JsonUtils.deepCopy(reason);
         newReason.setReasonType("fake-reason-type");
+        doReturn(Flux.empty())
+            .when(spyNotificationCenter).listSubscription(eq(subscriber), eq(newReason));
         when(client.delete(any(Subscription.class))).thenReturn(Mono.empty());
         spyNotificationCenter.unsubscribe(subscriber, newReason).block();
         verify(client, times(0)).delete(any(Subscription.class));
+
+        doReturn(Flux.just(subscription))
+            .when(spyNotificationCenter).listSubscription(eq(subscriber), eq(reason));
 
         // exists subscription will be deleted
         spyNotificationCenter.unsubscribe(subscriber, reason).block();
@@ -362,63 +368,8 @@ class DefaultNotificationCenterTest {
         verify(notificationTemplateSelector).select(eq(reasonTypeName), any());
     }
 
-    @Test
-    @SuppressWarnings("unchecked")
-    void listSubscriptionTest() {
-        var subscriptions = createSubscriptions();
-
-        when(client.list(eq(Subscription.class), any(Predicate.class), any()))
-            .thenAnswer(answer -> {
-                var predicate = (Predicate<Subscription>) answer.getArgument(1, Predicate.class);
-                return Flux.fromIterable(subscriptions)
-                    .filter(predicate);
-            });
-
-        var subscription = subscriptions.get(0);
-        var subscriber = subscription.getSpec().getSubscriber();
-        notificationCenter.listSubscription(subscriber)
-            .as(StepVerifier::create)
-            .expectNext(subscription)
-            .verifyComplete();
-
-        verify(client).list(eq(Subscription.class), any(Predicate.class), any());
-
-        var otherSubscriber = JsonUtils.deepCopy(subscriber);
-        otherSubscriber.setName("other");
-        notificationCenter.listSubscription(otherSubscriber)
-            .as(StepVerifier::create)
-            .verifyComplete();
-    }
 
     @Test
-    @SuppressWarnings("unchecked")
-    void listObserversTest() {
-        var subscriptions = createSubscriptions();
-
-        when(client.list(eq(Subscription.class), any(Predicate.class), any()))
-            .thenAnswer(answer -> {
-                var predicate = (Predicate<Subscription>) answer.getArgument(1, Predicate.class);
-                return Flux.fromIterable(subscriptions)
-                    .filter(predicate);
-            });
-
-        var subscription = subscriptions.get(0);
-        var reasonTypeName = subscription.getSpec().getReason().getReasonType();
-        var reasonSubject = subscription.getSpec().getReason().getSubject();
-        notificationCenter.listObservers(reasonTypeName, reasonSubject)
-            .as(StepVerifier::create)
-            .expectNext(subscription)
-            .verifyComplete();
-
-        verify(client).list(eq(Subscription.class), any(Predicate.class), any());
-
-        notificationCenter.listObservers("other-reason", reasonSubject)
-            .as(StepVerifier::create)
-            .verifyComplete();
-    }
-
-    @Test
-    @SuppressWarnings("unchecked")
     void listObserverWhenDuplicateSubscribers() {
         var sourceSubscriptions = createSubscriptions();
         var subscriptionA = sourceSubscriptions.get(0);
@@ -427,26 +378,11 @@ class DefaultNotificationCenterTest {
         var subscriptionC = JsonUtils.deepCopy(subscriptionA);
         subscriptionC.getSpec().getReason().getSubject().setName(null);
 
-        var subscriptions = List.of(subscriptionA, subscriptionB, subscriptionC);
-        when(client.list(eq(Subscription.class), any(Predicate.class), any()))
-            .thenAnswer(answer -> {
-                var predicate = (Predicate<Subscription>) answer.getArgument(1, Predicate.class);
-                return Flux.fromIterable(subscriptions)
-                    .filter(predicate);
-            });
+        var subscriptions = Flux.just(subscriptionA, subscriptionB, subscriptionC);
 
-        var subscription = subscriptions.get(0);
-        var reasonTypeName = subscription.getSpec().getReason().getReasonType();
-        var reasonSubject = subscription.getSpec().getReason().getSubject();
-        notificationCenter.listObservers(reasonTypeName, reasonSubject)
+        DefaultNotificationCenter.distinctByKey(subscriptions)
             .as(StepVerifier::create)
-            .expectNext(subscription)
-            .verifyComplete();
-
-        verify(client).list(eq(Subscription.class), any(Predicate.class), any());
-
-        notificationCenter.listObservers("other-reason", reasonSubject)
-            .as(StepVerifier::create)
+            .expectNext(subscriptionA)
             .verifyComplete();
     }
 

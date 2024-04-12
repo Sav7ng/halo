@@ -1,11 +1,13 @@
 package run.halo.app.plugin.extensionpoint;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Stream;
 import lombok.RequiredArgsConstructor;
 import org.pf4j.ExtensionPoint;
+import org.pf4j.PluginManager;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.annotation.AnnotationAwareOrderComparator;
 import org.springframework.lang.NonNull;
@@ -15,7 +17,6 @@ import reactor.core.publisher.Mono;
 import run.halo.app.extension.ReactiveExtensionClient;
 import run.halo.app.infra.SystemConfigurableEnvironmentFetcher;
 import run.halo.app.infra.SystemSetting.ExtensionPointEnabled;
-import run.halo.app.plugin.HaloPluginManager;
 
 @Component
 @RequiredArgsConstructor
@@ -23,7 +24,7 @@ public class DefaultExtensionGetter implements ExtensionGetter {
 
     private final SystemConfigurableEnvironmentFetcher systemConfigFetcher;
 
-    private final HaloPluginManager pluginManager;
+    private final PluginManager pluginManager;
 
     private final ApplicationContext applicationContext;
 
@@ -84,6 +85,15 @@ public class DefaultExtensionGetter implements ExtensionGetter {
                 // TODO If the type is sortable, may need to process the returned order.
                 return Flux.fromIterable(getAllExtensions(extensionPoint));
             });
+    }
+
+    @Override
+    public <T extends ExtensionPoint> Flux<T> getExtensions(Class<T> extensionPointClass) {
+        var extensions = new ArrayList<>(pluginManager.getExtensions(extensionPointClass));
+        applicationContext.getBeanProvider(extensionPointClass)
+            .orderedStream()
+            .forEach(extensions::add);
+        return Flux.fromIterable(extensions);
     }
 
     @NonNull

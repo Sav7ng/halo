@@ -1,6 +1,9 @@
 package run.halo.app.notification;
 
 import static org.apache.commons.lang3.StringUtils.defaultString;
+import static run.halo.app.extension.index.query.QueryFactory.and;
+import static run.halo.app.extension.index.query.QueryFactory.equal;
+import static run.halo.app.extension.index.query.QueryFactory.or;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -12,7 +15,9 @@ import lombok.Builder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Component;
+import org.springframework.util.Assert;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
@@ -23,8 +28,14 @@ import run.halo.app.core.extension.notification.Reason;
 import run.halo.app.core.extension.notification.ReasonType;
 import run.halo.app.core.extension.notification.Subscription;
 import run.halo.app.extension.GroupVersionKind;
+import run.halo.app.extension.ListOptions;
+import run.halo.app.extension.ListResult;
 import run.halo.app.extension.Metadata;
+import run.halo.app.extension.PageRequest;
+import run.halo.app.extension.PageRequestImpl;
 import run.halo.app.extension.ReactiveExtensionClient;
+import run.halo.app.extension.index.query.Query;
+import run.halo.app.extension.router.selector.FieldSelector;
 import run.halo.app.notification.endpoint.SubscriptionRouter;
 
 /**
@@ -66,8 +77,7 @@ public class DefaultNotificationCenter implements NotificationCenter {
     @Override
     public Mono<Subscription> subscribe(Subscription.Subscriber subscriber,
         Subscription.InterestReason reason) {
-        return listSubscription(subscriber)
-            .filter(subscription -> subscription.getSpec().getReason().equals(reason))
+        return listSubscription(subscriber, reason)
             .next()
             .switchIfEmpty(Mono.defer(() -> {
                 var subscription = new Subscription();
@@ -83,7 +93,15 @@ public class DefaultNotificationCenter implements NotificationCenter {
 
     @Override
     public Mono<Void> unsubscribe(Subscription.Subscriber subscriber) {
-        return listSubscription(subscriber)
+        // pagination query all subscriptions of the subscriber to avoid large data
+        var pageRequest = PageRequestImpl.of(1, 200,
+            Sort.by("metadata.creationTimestamp", "metadata.name"));
+        return Flux.defer(() -> pageSubscriptionBy(subscriber, pageRequest))
+            .expand(page -> page.hasNext()
+                ? pageSubscriptionBy(subscriber, pageRequest)
+                : Mono.empty()
+            )
+            .flatMap(page -> Flux.fromIterable(page.getItems()))
             .flatMap(client::delete)
             .then();
     }
@@ -91,16 +109,28 @@ public class DefaultNotificationCenter implements NotificationCenter {
     @Override
     public Mono<Void> unsubscribe(Subscription.Subscriber subscriber,
         Subscription.InterestReason reason) {
-        return listSubscription(subscriber)
-            .filter(subscription -> subscription.getSpec().getReason().equals(reason))
+        return listSubscription(subscriber, reason)
             .flatMap(client::delete)
             .then();
     }
 
-    Flux<Subscription> listSubscription(Subscription.Subscriber subscriber) {
-        return client.list(Subscription.class,
-            subscription -> subscription.getSpec().getSubscriber().equals(subscriber),
-            null);
+    Mono<ListResult<Subscription>> pageSubscriptionBy(Subscription.Subscriber subscriber,
+        PageRequest pageRequest) {
+        var listOptions = new ListOptions();
+        var fieldQuery = equal("spec.subscriber", subscriber.getName());
+        listOptions.setFieldSelector(FieldSelector.of(fieldQuery));
+        return client.listBy(Subscription.class, listOptions, pageRequest);
+    }
+
+    Flux<Subscription> listSubscription(Subscription.Subscriber subscriber,
+        Subscription.InterestReason reason) {
+        var listOptions = new ListOptions();
+        var fieldQuery = and(
+            getSubscriptionFieldQuery(reason.getReasonType(), reason.getSubject()),
+            equal("spec.subscriber", subscriber.getName())
+        );
+        listOptions.setFieldSelector(FieldSelector.of(fieldQuery));
+        return client.listAll(Subscription.class, listOptions, defaultSort());
     }
 
     Flux<String> getNotifiersBySubscriber(Subscription.Subscriber subscriber, Reason reason) {
@@ -310,31 +340,46 @@ public class DefaultNotificationCenter implements NotificationCenter {
 
     Flux<Subscription> listObservers(String reasonTypeName,
         Subscription.ReasonSubject reasonSubject) {
-        var distinctKeyPredicate = subscriptionDistinctKeyPredicate();
-        return client.list(Subscription.class,
-                subscription -> {
-                    var interestReason = subscription.getSpec().getReason();
-                    var sourceSubject = interestReason.getSubject();
-                    if (StringUtils.isBlank(sourceSubject.getName())) {
-                        return interestReason.getReasonType().equals(reasonTypeName)
-                            && sourceSubject.getApiVersion().equals(reasonSubject.getApiVersion())
-                            && sourceSubject.getKind().equals(reasonSubject.getKind());
+        Assert.notNull(reasonTypeName, "The reasonTypeName must not be null");
+        Assert.notNull(reasonSubject, "The reasonSubject must not be null");
+        final var listOptions = new ListOptions();
+        var fieldQuery = getSubscriptionFieldQuery(reasonTypeName, reasonSubject);
+        listOptions.setFieldSelector(FieldSelector.of(fieldQuery));
+        return distinctByKey(client.listAll(Subscription.class, listOptions, defaultSort()));
+    }
+
+    private static Query getSubscriptionFieldQuery(String reasonTypeName,
+        Subscription.ReasonSubject reasonSubject) {
+        var matchAllSubject = new Subscription.ReasonSubject();
+        matchAllSubject.setKind(reasonSubject.getKind());
+        matchAllSubject.setApiVersion(reasonSubject.getApiVersion());
+        return and(equal("spec.reason.reasonType", reasonTypeName),
+            or(equal("spec.reason.subject", reasonSubject.toString()),
+                // source reason subject name is blank present match all
+                equal("spec.reason.subject", matchAllSubject.toString())
+            )
+        );
+    }
+
+    static Flux<Subscription> distinctByKey(Flux<Subscription> source) {
+        final var distinctKeyPredicate = subscriptionDistinctKeyPredicate();
+        return source.distinct(Function.identity(), HashSet<Subscription>::new,
+            (set, val) -> {
+                for (Subscription subscription : set) {
+                    if (distinctKeyPredicate.test(subscription, val)) {
+                        return false;
                     }
-                    return interestReason.getReasonType().equals(reasonTypeName)
-                        && interestReason.getSubject().equals(reasonSubject);
-                }, null)
-            .distinct(Function.identity(), HashSet<Subscription>::new,
-                (set, val) -> {
-                    for (Subscription subscription : set) {
-                        if (distinctKeyPredicate.test(subscription, val)) {
-                            return false;
-                        }
-                    }
-                    // no duplicated return true
-                    set.add(val);
-                    return true;
-                },
-                HashSet::clear);
+                }
+                // no duplicated return true
+                set.add(val);
+                return true;
+            },
+            HashSet::clear);
+    }
+
+    Sort defaultSort() {
+        return Sort.by(Sort.Order.asc("metadata.creationTimestamp"),
+            Sort.Order.asc("metadata.name"));
     }
 
     static BiPredicate<Subscription, Subscription> subscriptionDistinctKeyPredicate() {
